@@ -284,6 +284,9 @@ public class Socket: PhoenixTransportDelegate {
   public func disconnect(code: CloseCode = CloseCode.normal,
                          reason: String? = nil,
                          callback: (() -> Void)? = nil) {
+    // Wait for any in-flight transport callback before mutating socket state.
+    self.connection?.delegate = nil
+    
     // The socket was closed cleanly by the User
     self.closeStatus = CloseStatus(closeCode: code.rawValue)
     
@@ -938,5 +941,13 @@ extension Socket {
         return false
       }
     }
+  }
+}
+
+@_spi(TransportTesting)
+extension Socket {
+  public var test_connection: PhoenixTransport? {
+    get { connection }
+    set { connection = newValue }
   }
 }
