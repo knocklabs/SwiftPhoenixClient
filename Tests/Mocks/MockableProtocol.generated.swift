@@ -42,7 +42,7 @@ class PhoenixTransportMock: PhoenixTransport {
     }
     var connectClosure: (() -> Void)?
 
-    func connect() {
+    func connect(with headers: [String: Any] = [:]) {
         connectCallsCount += 1
         connectClosure?()
     }

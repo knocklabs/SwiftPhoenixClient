@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file. The format 
 
 This product uses [Semantic Versioning](https://semver.org/).
 
+### Unreleased
+
+- Serialize `URLSessionTransport` lifecycle and callback delivery on a dedicated reentrant event queue, gate stale connection generations, and suppress duplicate terminal error/close events during teardown. Transport callbacks now run on this private serial queue rather than an unsynchronized URLSession delegate thread.
+- Wait for in-flight transport callbacks to finish before `Socket.disconnect()` mutates socket state.
+
+Behavior change: `onOpen`/`onMessage`/`onError`/`onClose` are now delivered while the transport
+holds its serial event queue, and `Socket` lifecycle calls acquire that same queue. Calling back
+into the socket from a callback is safe and runs inline. However, if your code holds its own lock
+or serial queue while calling `Socket` APIs, do not acquire that same lock *synchronously* from a
+socket callback — dispatch asynchronously instead, or the two will deadlock.
+
 ### 5.3.5
 
 - Fix `objc_loadWeakRetained` on iOS 18 in the `Transport` layer

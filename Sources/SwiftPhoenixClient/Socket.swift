@@ -284,6 +284,12 @@ public class Socket: PhoenixTransportDelegate {
   public func disconnect(code: CloseCode = CloseCode.normal,
                          reason: String? = nil,
                          callback: (() -> Void)? = nil) {
+    // `URLSessionTransport` serializes delegate access on its event queue, so clearing the
+    // delegate blocks until any in-flight callback has returned. That must happen before the
+    // `closeStatus` and `reconnectTimer` writes below, which those callbacks also touch.
+    // `teardown` clears it again; transports that don't serialize get no such barrier.
+    self.connection?.delegate = nil
+    
     // The socket was closed cleanly by the User
     self.closeStatus = CloseStatus(closeCode: code.rawValue)
     
