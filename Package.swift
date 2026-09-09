@@ -27,9 +27,5 @@ let package = Package(
         .testTarget(
             name: "SwiftPhoenixClientTests",
             dependencies: ["SwiftPhoenixClient"]),
-        .target(
-            name: "TransportRaceHarness",
-            dependencies: ["SwiftPhoenixClient"],
-            path: "Tools/TransportRaceHarness"),
     ]
 )

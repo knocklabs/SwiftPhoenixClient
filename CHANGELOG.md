@@ -6,14 +6,14 @@ This product uses [Semantic Versioning](https://semver.org/).
 
 ### Unreleased
 
-- Serialize `URLSessionTransport` lifecycle and callback delivery on a dedicated reentrant event queue, gate stale connection generations, and suppress duplicate terminal error/close events during teardown. Transport callbacks now run on this private serial queue rather than an unsynchronized URLSession delegate thread.
+- Guard all `URLSessionTransport` state with a dedicated serial queue, gate stale connection generations, and suppress duplicate terminal error/close events during teardown. Fixes the `EXC_BAD_ACCESS` crashes in [#289](https://github.com/davidstump/SwiftPhoenixClient/issues/289) and [#295](https://github.com/davidstump/SwiftPhoenixClient/issues/295), caused by `Socket.teardown()` racing URLSession delegate callbacks and the `receive()` task over the transport's `delegate`.
+- Deliver transport callbacks under a separate delivery lock rather than the state queue, so a callback never runs with transport state locked. Setting `delegate` waits for any in-flight callback, which is the guarantee `Socket.disconnect()` relies on.
+- Hand receive results to a dedicated queue instead of blocking a Swift concurrency cooperative thread.
 - Wait for in-flight transport callbacks to finish before `Socket.disconnect()` mutates socket state.
 
-Behavior change: `onOpen`/`onMessage`/`onError`/`onClose` are now delivered while the transport
-holds its serial event queue, and `Socket` lifecycle calls acquire that same queue. Calling back
-into the socket from a callback is safe and runs inline. However, if your code holds its own lock
-or serial queue while calling `Socket` APIs, do not acquire that same lock *synchronously* from a
-socket callback — dispatch asynchronously instead, or the two will deadlock.
+Behavior change: `onOpen`/`onMessage`/`onError`/`onClose` are serialized with each other and are
+no longer delivered on the URLSession delegate thread. Calling back into the socket from a
+callback is safe. Blocking inside a callback delays later callbacks rather than transport state.
 
 ### 5.3.5
 

@@ -68,13 +68,13 @@ public protocol PhoenixTransport {
 /**
  Delegate to receive notifications of events that occur in the `Transport` layer
  
- `URLSessionTransport` delivers these callbacks serially, while holding its internal event
- queue. Two consequences:
+ `URLSessionTransport` delivers these callbacks serially, on an unspecified background thread,
+ and never while holding the lock that guards its own state. Calling back into the `Socket` or
+ the transport from a callback is therefore safe.
  
- - Blocking inside a callback stalls the transport, including its teardown.
- - Calling back into the `Socket` or the transport from a callback is safe and runs inline,
-   but acquiring a lock of your own *synchronously* from a callback will deadlock if you also
-   call `Socket` while holding that lock. Dispatch asynchronously in that case.
+ Clearing `delegate` waits for any in-flight callback to return, so once it completes no
+ further callback will arrive. Blocking inside a callback delays subsequent callbacks and any
+ concurrent `delegate` assignment, but not the transport's state transitions.
  */
 public protocol PhoenixTransportDelegate {
   
@@ -147,11 +147,27 @@ public enum PhoenixTransportReadyState {
 @available(macOS 10.15, iOS 13, watchOS 6, tvOS 13, *)
 open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketDelegate {
   
-  /// Serializes transport state, lifecycle calls, URLSession callbacks, and receive results.
-  /// Reentrant calls from inside a callback run inline so `onOpen`/`onError` can safely
-  /// read `readyState`, send, or disconnect without deadlocking.
+  /// Guards all mutable transport state.
+  ///
+  /// Held only for state reads and writes, never across a delegate callback. Delivering a
+  /// callback while holding this would make it a lock with unbounded hold time: `Socket`'s
+  /// open/close handlers call into the process-global `Defaults.heartbeatQueue`, while the
+  /// heartbeat handler runs on that queue and reads `readyState` from here, so the two would
+  /// deadlock. Reentrant calls run inline so a callback can read state, send, or disconnect.
   private let eventQueue = DispatchQueue(label: "com.phoenix.transport.events")
   private let eventQueueKey = DispatchSpecificKey<Void>()
+  
+  /// Serializes delegate callbacks with each other and with changes to `delegate`.
+  ///
+  /// Taken without `eventQueue` held, so it never participates in a cycle with a lock a
+  /// callback might acquire. Clearing `delegate` blocks until an in-flight callback returns,
+  /// which is the drain `Socket.disconnect()` depends on. Recursive so a callback that
+  /// reentrantly disconnects or reassigns the delegate does not deadlock against itself.
+  private let deliveryLock = NSRecursiveLock()
+  
+  /// Where receive results are handled. Keeps that work off both the Swift concurrency
+  /// cooperative pool and `eventQueue`, so delivery can happen with no queue held.
+  private let receiveQueue = DispatchQueue(label: "com.phoenix.transport.receive")
   
   /// The URL to connect to
   internal let url: URL
@@ -254,7 +270,12 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
   
   public var delegate: PhoenixTransportDelegate? {
     get { syncOnEventQueue { _delegate } }
-    set { syncOnEventQueue { _delegate = newValue } }
+    set {
+      // Waits for any in-flight callback so the caller can rely on no further delivery.
+      deliveryLock.lock()
+      defer { deliveryLock.unlock() }
+      syncOnEventQueue { _delegate = newValue }
+    }
   }
   
   public func connect(with headers: [String : Any]) {
@@ -262,10 +283,11 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
       self.resetForNewConnection()
       self._readyState = .connecting
       
+      // Deliberately not backed by `eventQueue`: URLSession callbacks must be free to take
+      // that queue for state and then release it before delivering to the delegate.
       let operationQueue = OperationQueue()
       operationQueue.name = "com.phoenix.transport.session"
       operationQueue.maxConcurrentOperationCount = 1
-      operationQueue.underlyingQueue = self.eventQueue
       
       self.session = URLSession(configuration: self.configuration,
                                 delegate: self,
@@ -314,25 +336,23 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
   open func urlSession(_ session: URLSession,
                        webSocketTask: URLSessionWebSocketTask,
                        didOpenWithProtocol protocol: String?) {
-    syncOnEventQueue {
-      self.handleOpen(response: webSocketTask.response,
-                      generation: self.generation,
-                      session: session,
-                      task: webSocketTask)
-    }
+    // Read the generation under the queue, then release it: the handlers re-check it before
+    // acting, so a generation that changes in between just means the event is stale.
+    handleOpen(response: webSocketTask.response,
+               generation: currentGeneration(),
+               session: session,
+               task: webSocketTask)
   }
   
   open func urlSession(_ session: URLSession,
                        webSocketTask: URLSessionWebSocketTask,
                        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                        reason: Data?) {
-    syncOnEventQueue {
-      self.handleClose(code: closeCode.rawValue,
-                       reason: reason.flatMap { String(data: $0, encoding: .utf8) },
-                       generation: self.generation,
-                       session: session,
-                       task: webSocketTask)
-    }
+    handleClose(code: closeCode.rawValue,
+                reason: reason.flatMap { String(data: $0, encoding: .utf8) },
+                generation: currentGeneration(),
+                session: session,
+                task: webSocketTask)
   }
   
   open func urlSession(_ session: URLSession,
@@ -342,13 +362,11 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
     // if this was caused by an error.
     guard let err = error else { return }
     
-    syncOnEventQueue {
-      self.handleFailure(err,
-                         response: task.response,
-                         generation: self.generation,
-                         session: session,
-                         task: task)
-    }
+    handleFailure(err,
+                  response: task.response,
+                  generation: currentGeneration(),
+                  session: session,
+                  task: task)
   }
   
   
@@ -370,6 +388,10 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
     session?.finishTasksAndInvalidate()
     session = nil
     task = nil
+  }
+  
+  private func currentGeneration() -> UInt64 {
+    syncOnEventQueue { generation }
   }
   
   private func cancelReceiveTask() {
@@ -407,16 +429,34 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
     return false
   }
   
+  /// Delivers to whichever delegate is current at delivery time, with the event queue released.
+  ///
+  /// The delegate is read *inside* the delivery lock, which the `delegate` setter also takes.
+  /// Reading it before acquiring the lock would let a callback fire against a delegate that had
+  /// since been cleared, racing whatever the clearing caller went on to do.
+  private func deliver(_ body: (PhoenixTransportDelegate) -> Void) {
+    deliveryLock.lock()
+    defer { deliveryLock.unlock() }
+    guard let delegate = syncOnEventQueue({ _delegate }) else { return }
+    body(delegate)
+  }
+  
   private func handleOpen(response: URLResponse?,
                           generation eventGeneration: UInt64,
                           session: URLSession?,
                           task: URLSessionTask?) {
-    guard isCurrent(eventGeneration, session: session, task: task) else { return }
-    guard _readyState == .connecting || _readyState == .open else { return }
+    let didOpen: Bool = syncOnEventQueue {
+      guard isCurrent(eventGeneration, session: session, task: task) else { return false }
+      // Only a connecting transport can open; re-entry would arm a second receive loop.
+      guard _readyState == .connecting else { return false }
+      
+      _readyState = .open
+      armReceive()
+      return true
+    }
     
-    _readyState = .open
-    armReceive()
-    _delegate?.onOpen(response: response)
+    guard didOpen else { return }
+    deliver { $0.onOpen(response: response) }
   }
   
   private func handleClose(code: Int,
@@ -424,13 +464,18 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
                            generation eventGeneration: UInt64,
                            session: URLSession?,
                            task: URLSessionTask?) {
-    guard isCurrent(eventGeneration, session: session, task: task) else { return }
-    guard !hasDeliveredTerminalEvent else { return }
+    let didClose: Bool = syncOnEventQueue {
+      guard isCurrent(eventGeneration, session: session, task: task) else { return false }
+      guard !hasDeliveredTerminalEvent else { return false }
+      
+      hasDeliveredTerminalEvent = true
+      _readyState = .closed
+      cancelReceiveTask()
+      return true
+    }
     
-    hasDeliveredTerminalEvent = true
-    _readyState = .closed
-    cancelReceiveTask()
-    _delegate?.onClose(code: code, reason: reason)
+    guard didClose else { return }
+    deliver { $0.onClose(code: code, reason: reason) }
   }
   
   private func handleFailure(_ error: Error,
@@ -438,46 +483,69 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
                              generation eventGeneration: UInt64,
                              session: URLSession?,
                              task: URLSessionTask?) {
-    guard isCurrent(eventGeneration, session: session, task: task) else { return }
-    guard !hasDeliveredTerminalEvent, !isExpectedTeardownError(error) else { return }
+    let didFail: Bool = syncOnEventQueue {
+      guard isCurrent(eventGeneration, session: session, task: task) else { return false }
+      guard !hasDeliveredTerminalEvent, !isExpectedTeardownError(error) else { return false }
+      
+      hasDeliveredTerminalEvent = true
+      _readyState = .closed
+      cancelReceiveTask()
+      return true
+    }
     
-    hasDeliveredTerminalEvent = true
-    _readyState = .closed
-    cancelReceiveTask()
+    guard didFail else { return }
     
-    _delegate?.onError(error: error, response: response)
+    // One acquisition for both callbacks, so nothing interleaves between error and close.
+    deliveryLock.lock()
+    defer { deliveryLock.unlock() }
+    
+    guard let delegate = syncOnEventQueue({ _delegate }) else { return }
+    delegate.onError(error: error, response: response)
     
     // `onError` may have reentrantly disconnected or reconnected. A user-initiated close
     // reports itself, so stacking an abnormal close on top of it would double-report.
-    guard isCurrent(eventGeneration, session: session, task: task),
-          !isClosingIntentionally,
-          let delegate = _delegate else { return }
+    let closeDelegate: PhoenixTransportDelegate? = syncOnEventQueue {
+      guard isCurrent(eventGeneration, session: session, task: task),
+            !isClosingIntentionally else { return nil }
+      return _delegate
+    }
     
-    delegate.onClose(code: Socket.CloseCode.abnormal.rawValue,
-                     reason: error.localizedDescription)
+    closeDelegate?.onClose(code: Socket.CloseCode.abnormal.rawValue,
+                           reason: error.localizedDescription)
   }
   
   private func handleReceiveResult(_ result: Result<URLSessionWebSocketTask.Message, Error>,
                                    generation eventGeneration: UInt64,
                                    task: URLSessionWebSocketTask?) {
-    guard isCurrent(eventGeneration, session: nil, task: task) else { return }
-    
     switch result {
     case .success(let message):
-      guard _readyState == .open else { return }
-      switch message {
-      case .data:
-        print("Data received. This method is unsupported by the Client")
-      case .string(let text):
-        _delegate?.onMessage(message: text)
-      default:
-        fatalError("Nil message received.")
+      let text: String? = syncOnEventQueue {
+        guard isCurrent(eventGeneration, session: nil, task: task), _readyState == .open else {
+          return nil
+        }
+        switch message {
+        case .data:
+          print("Data received. This method is unsupported by the Client")
+          return nil
+        case .string(let text):
+          return text
+        default:
+          fatalError("Nil message received.")
+        }
       }
       
+      guard let text else { return }
+      
+      deliver { $0.onMessage(message: text) }
+      
       // `onMessage` may have reentrantly disconnected or reconnected.
-      guard isCurrent(eventGeneration, session: nil, task: task), _readyState == .open else { return }
-      receiveRearmAttempts += 1
-      armReceive()
+      syncOnEventQueue {
+        guard isCurrent(eventGeneration, session: nil, task: task), _readyState == .open else {
+          return
+        }
+        receiveRearmAttempts += 1
+        armReceive()
+      }
       
     case .failure(let error):
       handleFailure(error,
@@ -488,9 +556,12 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
     }
   }
   
+  /// Must be called with the event queue held.
   private func armReceive() {
     let currentGeneration = generation
     guard let currentTask = task, _readyState == .open else { return }
+    
+    cancelReceiveTask()
     receiveMessageTask = Task { [weak self] in
       let result: Result<URLSessionWebSocketTask.Message, Error>
       do {
@@ -499,7 +570,8 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
         result = .failure(error)
       }
       guard let self else { return }
-      self.syncOnEventQueue {
+      // Hand off rather than blocking here: blocking a cooperative-pool thread is unsupported.
+      self.receiveQueue.async {
         self.handleReceiveResult(result, generation: currentGeneration, task: currentTask)
       }
     }
@@ -552,20 +624,18 @@ extension URLSessionTransport {
   /// Passing `generation` simulates a straggling event from a superseded connection attempt.
   /// Injected events carry no URLSession identity, so the generation alone gates them.
   public func test_inject(_ event: TestEvent, generation eventGeneration: UInt64? = nil) {
-    syncOnEventQueue {
-      let generation = eventGeneration ?? self.generation
-      switch event {
-      case .open(let response):
-        self.handleOpen(response: response, generation: generation, session: nil, task: nil)
-      case .close(let code, let reason):
-        self.handleClose(code: code, reason: reason, generation: generation, session: nil, task: nil)
-      case .completeWithError(let error, let response):
-        self.handleFailure(error, response: response, generation: generation, session: nil, task: nil)
-      case .receiveMessage(let message):
-        self.handleReceiveResult(.success(message), generation: generation, task: nil)
-      case .receiveFailure(let error):
-        self.handleReceiveResult(.failure(error), generation: generation, task: nil)
-      }
+    let generation = eventGeneration ?? currentGeneration()
+    switch event {
+    case .open(let response):
+      handleOpen(response: response, generation: generation, session: nil, task: nil)
+    case .close(let code, let reason):
+      handleClose(code: code, reason: reason, generation: generation, session: nil, task: nil)
+    case .completeWithError(let error, let response):
+      handleFailure(error, response: response, generation: generation, session: nil, task: nil)
+    case .receiveMessage(let message):
+      handleReceiveResult(.success(message), generation: generation, task: nil)
+    case .receiveFailure(let error):
+      handleReceiveResult(.failure(error), generation: generation, task: nil)
     }
   }
 }
