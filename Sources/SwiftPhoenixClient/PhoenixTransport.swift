@@ -67,6 +67,14 @@ public protocol PhoenixTransport {
 //----------------------------------------------------------------------
 /**
  Delegate to receive notifications of events that occur in the `Transport` layer
+ 
+ `URLSessionTransport` delivers these callbacks serially, while holding its internal event
+ queue. Two consequences:
+ 
+ - Blocking inside a callback stalls the transport, including its teardown.
+ - Calling back into the `Socket` or the transport from a callback is safe and runs inline,
+   but acquiring a lock of your own *synchronously* from a callback will deadlock if you also
+   call `Socket` while holding that lock. Dispatch asynchronously in that case.
  */
 public protocol PhoenixTransportDelegate {
   
@@ -162,11 +170,32 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
   
   private var _readyState: PhoenixTransportReadyState = .closed
   private var _delegate: PhoenixTransportDelegate? = nil
+  
+  /// Identifies the current connection attempt.
+  ///
+  /// A cancelled URLSession task and the detached `receive()` task can both deliver events
+  /// after a new connection has already been opened. Stamping every event with the generation
+  /// it originated from lets those stragglers be dropped instead of being applied to, or
+  /// tearing down, the live connection.
   private var generation: UInt64 = 0
+  
+  /// Whether this generation has already reported an error or close.
+  ///
+  /// The URLSession delegate and the receive task can both observe the same failure, and each
+  /// would otherwise report it. This is deliberately not derived from `_readyState`, because
+  /// the public `readyState` setter lets callers move the state to `.closed` without any event
+  /// having been delivered.
   private var hasDeliveredTerminalEvent = false
+  
+  /// Whether `disconnect` was called, as opposed to the connection failing on its own.
+  ///
+  /// Cancelling a task surfaces as an error, so this distinguishes the cancellation we asked
+  /// for from a genuine failure. Orthogonal to `hasDeliveredTerminalEvent`: this is set when
+  /// the close is requested, that is set when an event is actually delivered.
   private var isClosingIntentionally = false
-  private var usesSimulatedConnection = false
-  private var receiveArmCount = 0
+  
+  /// Counts how many times a receive re-arm was attempted. Test observability only.
+  private var receiveRearmAttempts = 0
   
   /**
    Initializes a `Transport` layer built using URLSession's WebSocket
@@ -230,7 +259,7 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
   
   public func connect(with headers: [String : Any]) {
     syncOnEventQueue {
-      self.beginGeneration(simulated: false)
+      self.resetForNewConnection()
       self._readyState = .connecting
       
       let operationQueue = OperationQueue()
@@ -285,21 +314,25 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
   open func urlSession(_ session: URLSession,
                        webSocketTask: URLSessionWebSocketTask,
                        didOpenWithProtocol protocol: String?) {
-    handleOpen(response: webSocketTask.response,
-               eventGeneration: nil,
-               session: session,
-               task: webSocketTask)
+    syncOnEventQueue {
+      self.handleOpen(response: webSocketTask.response,
+                      generation: self.generation,
+                      session: session,
+                      task: webSocketTask)
+    }
   }
   
   open func urlSession(_ session: URLSession,
                        webSocketTask: URLSessionWebSocketTask,
                        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                        reason: Data?) {
-    handleClose(code: closeCode.rawValue,
-                reason: reason.flatMap { String(data: $0, encoding: .utf8) },
-                eventGeneration: nil,
-                session: session,
-                task: webSocketTask)
+    syncOnEventQueue {
+      self.handleClose(code: closeCode.rawValue,
+                       reason: reason.flatMap { String(data: $0, encoding: .utf8) },
+                       generation: self.generation,
+                       session: session,
+                       task: webSocketTask)
+    }
   }
   
   open func urlSession(_ session: URLSession,
@@ -309,11 +342,13 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
     // if this was caused by an error.
     guard let err = error else { return }
     
-    handleAbnormalError(err,
-                        response: task.response,
-                        eventGeneration: nil,
-                        session: session,
-                        task: task)
+    syncOnEventQueue {
+      self.handleFailure(err,
+                         response: task.response,
+                         generation: self.generation,
+                         session: session,
+                         task: task)
+    }
   }
   
   
@@ -326,11 +361,11 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
     return eventQueue.sync(execute: work)
   }
   
-  private func beginGeneration(simulated: Bool) {
+  /// Retires the previous connection attempt and starts a new generation.
+  private func resetForNewConnection() {
     generation += 1
     hasDeliveredTerminalEvent = false
     isClosingIntentionally = false
-    usesSimulatedConnection = simulated
     cancelReceiveTask()
     session?.finishTasksAndInvalidate()
     session = nil
@@ -342,14 +377,22 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
     receiveMessageTask = nil
   }
   
-  private func shouldAccept(eventGeneration: UInt64,
-                            session: URLSession?,
-                            task: URLSessionTask?) -> Bool {
+  /// Whether an event still belongs to the live connection attempt.
+  ///
+  /// `session` and `task` are nil for events that carry no URLSession identity, in which case
+  /// the generation alone decides.
+  private func isCurrent(_ eventGeneration: UInt64,
+                         session: URLSession?,
+                         task: URLSessionTask?) -> Bool {
     guard eventGeneration == generation else { return false }
-    if usesSimulatedConnection { return true }
     if let session = session, session !== self.session { return false }
     if let task = task, task !== self.task { return false }
     return true
+  }
+  
+  /// Whether an error is just the acknowledgement of a close we asked for.
+  private func isExpectedTeardownError(_ error: Error) -> Bool {
+    isClosingIntentionally && isCancellationError(error)
   }
   
   private func isCancellationError(_ error: Error) -> Bool {
@@ -365,100 +408,83 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
   }
   
   private func handleOpen(response: URLResponse?,
-                          eventGeneration: UInt64?,
+                          generation eventGeneration: UInt64,
                           session: URLSession?,
                           task: URLSessionTask?) {
-    syncOnEventQueue {
-      let eventGeneration = eventGeneration ?? self.generation
-      guard self.shouldAccept(eventGeneration: eventGeneration, session: session, task: task) else { return }
-      guard self._readyState == .connecting || self._readyState == .open else { return }
-      
-      self._readyState = .open
-      self.armReceive()
-      self._delegate?.onOpen(response: response)
-    }
+    guard isCurrent(eventGeneration, session: session, task: task) else { return }
+    guard _readyState == .connecting || _readyState == .open else { return }
+    
+    _readyState = .open
+    armReceive()
+    _delegate?.onOpen(response: response)
   }
   
   private func handleClose(code: Int,
                            reason: String?,
-                           eventGeneration: UInt64?,
+                           generation eventGeneration: UInt64,
                            session: URLSession?,
                            task: URLSessionTask?) {
-    syncOnEventQueue {
-      let eventGeneration = eventGeneration ?? self.generation
-      guard self.shouldAccept(eventGeneration: eventGeneration, session: session, task: task) else { return }
-      guard !self.hasDeliveredTerminalEvent else { return }
-      
-      self.hasDeliveredTerminalEvent = true
-      self._readyState = .closed
-      self.cancelReceiveTask()
-      self._delegate?.onClose(code: code, reason: reason)
-    }
+    guard isCurrent(eventGeneration, session: session, task: task) else { return }
+    guard !hasDeliveredTerminalEvent else { return }
+    
+    hasDeliveredTerminalEvent = true
+    _readyState = .closed
+    cancelReceiveTask()
+    _delegate?.onClose(code: code, reason: reason)
   }
   
-  private func handleAbnormalError(_ error: Error,
-                                   response: URLResponse?,
-                                   eventGeneration: UInt64?,
-                                   session: URLSession?,
-                                   task: URLSessionTask?) {
-    syncOnEventQueue {
-      let eventGeneration = eventGeneration ?? self.generation
-      guard self.shouldAccept(eventGeneration: eventGeneration, session: session, task: task) else { return }
-      guard !self.hasDeliveredTerminalEvent else { return }
-      
-      if self.isClosingIntentionally && self.isCancellationError(error) {
-        return
-      }
-      
-      self.hasDeliveredTerminalEvent = true
-      self._readyState = .closed
-      self.cancelReceiveTask()
-      
-      let currentGeneration = self.generation
-      self._delegate?.onError(error: error, response: response)
-      
-      // An error callback may reentrantly disconnect and already notify close.
-      guard self.generation == currentGeneration,
-            !self.isClosingIntentionally,
-            self._delegate != nil else { return }
-      
-      self._delegate?.onClose(code: Socket.CloseCode.abnormal.rawValue,
-                              reason: error.localizedDescription)
-    }
+  private func handleFailure(_ error: Error,
+                             response: URLResponse?,
+                             generation eventGeneration: UInt64,
+                             session: URLSession?,
+                             task: URLSessionTask?) {
+    guard isCurrent(eventGeneration, session: session, task: task) else { return }
+    guard !hasDeliveredTerminalEvent, !isExpectedTeardownError(error) else { return }
+    
+    hasDeliveredTerminalEvent = true
+    _readyState = .closed
+    cancelReceiveTask()
+    
+    _delegate?.onError(error: error, response: response)
+    
+    // `onError` may have reentrantly disconnected or reconnected. A user-initiated close
+    // reports itself, so stacking an abnormal close on top of it would double-report.
+    guard isCurrent(eventGeneration, session: session, task: task),
+          !isClosingIntentionally,
+          let delegate = _delegate else { return }
+    
+    delegate.onClose(code: Socket.CloseCode.abnormal.rawValue,
+                     reason: error.localizedDescription)
   }
   
   private func handleReceiveResult(_ result: Result<URLSessionWebSocketTask.Message, Error>,
-                                   eventGeneration: UInt64,
+                                   generation eventGeneration: UInt64,
                                    task: URLSessionWebSocketTask?) {
-    syncOnEventQueue {
-      guard self.shouldAccept(eventGeneration: eventGeneration, session: nil, task: task) else { return }
-      
-      switch result {
-      case .success(let message):
-        guard self._readyState == .open else { return }
-        switch message {
-        case .data:
-          print("Data received. This method is unsupported by the Client")
-        case .string(let text):
-          self._delegate?.onMessage(message: text)
-        default:
-          fatalError("Nil message received.")
-        }
-        
-        guard self.generation == eventGeneration, self._readyState == .open else { return }
-        self.receiveArmCount += 1
-        self.armReceive()
-        
-      case .failure(let error):
-        if !(self.isClosingIntentionally && self.isCancellationError(error)) {
-          print("Error when receiving \(error)")
-        }
-        self.handleAbnormalError(error,
-                                 response: nil,
-                                 eventGeneration: eventGeneration,
-                                 session: nil,
-                                 task: task)
+    guard isCurrent(eventGeneration, session: nil, task: task) else { return }
+    
+    switch result {
+    case .success(let message):
+      guard _readyState == .open else { return }
+      switch message {
+      case .data:
+        print("Data received. This method is unsupported by the Client")
+      case .string(let text):
+        _delegate?.onMessage(message: text)
+      default:
+        fatalError("Nil message received.")
       }
+      
+      // `onMessage` may have reentrantly disconnected or reconnected.
+      guard isCurrent(eventGeneration, session: nil, task: task), _readyState == .open else { return }
+      receiveRearmAttempts += 1
+      armReceive()
+      
+    case .failure(let error):
+      handleFailure(error,
+                    response: nil,
+                    generation: eventGeneration,
+                    session: nil,
+                    task: task)
     }
   }
   
@@ -472,7 +498,10 @@ open class URLSessionTransport: NSObject, PhoenixTransport, URLSessionWebSocketD
       } catch {
         result = .failure(error)
       }
-      self?.handleReceiveResult(result, eventGeneration: currentGeneration, task: currentTask)
+      guard let self else { return }
+      self.syncOnEventQueue {
+        self.handleReceiveResult(result, generation: currentGeneration, task: currentTask)
+      }
     }
   }
 }
@@ -494,14 +523,14 @@ extension URLSessionTransport {
     syncOnEventQueue { generation }
   }
   
-  public var test_receiveArmCount: Int {
-    syncOnEventQueue { receiveArmCount }
+  public var test_receiveRearmAttempts: Int {
+    syncOnEventQueue { receiveRearmAttempts }
   }
   
   @discardableResult
   public func test_simulateConnecting() -> UInt64 {
     syncOnEventQueue {
-      self.beginGeneration(simulated: true)
+      self.resetForNewConnection()
       self._readyState = .connecting
       return self.generation
     }
@@ -511,27 +540,32 @@ extension URLSessionTransport {
   public func test_simulateOpen() -> UInt64 {
     syncOnEventQueue {
       if self.generation == 0 {
-        self.beginGeneration(simulated: true)
+        self.resetForNewConnection()
       }
       self._readyState = .open
       return self.generation
     }
   }
   
+  /// Delivers `event` as though it came from URLSession or the receive task.
+  ///
+  /// Passing `generation` simulates a straggling event from a superseded connection attempt.
+  /// Injected events carry no URLSession identity, so the generation alone gates them.
   public func test_inject(_ event: TestEvent, generation eventGeneration: UInt64? = nil) {
-    switch event {
-    case .open(let response):
-      handleOpen(response: response, eventGeneration: eventGeneration, session: nil, task: nil)
-    case .close(let code, let reason):
-      handleClose(code: code, reason: reason, eventGeneration: eventGeneration, session: nil, task: nil)
-    case .completeWithError(let error, let response):
-      handleAbnormalError(error, response: response, eventGeneration: eventGeneration, session: nil, task: nil)
-    case .receiveMessage(let message):
-      let generation = eventGeneration ?? test_generation
-      handleReceiveResult(.success(message), eventGeneration: generation, task: nil)
-    case .receiveFailure(let error):
-      let generation = eventGeneration ?? test_generation
-      handleReceiveResult(.failure(error), eventGeneration: generation, task: nil)
+    syncOnEventQueue {
+      let generation = eventGeneration ?? self.generation
+      switch event {
+      case .open(let response):
+        self.handleOpen(response: response, generation: generation, session: nil, task: nil)
+      case .close(let code, let reason):
+        self.handleClose(code: code, reason: reason, generation: generation, session: nil, task: nil)
+      case .completeWithError(let error, let response):
+        self.handleFailure(error, response: response, generation: generation, session: nil, task: nil)
+      case .receiveMessage(let message):
+        self.handleReceiveResult(.success(message), generation: generation, task: nil)
+      case .receiveFailure(let error):
+        self.handleReceiveResult(.failure(error), generation: generation, task: nil)
+      }
     }
   }
 }

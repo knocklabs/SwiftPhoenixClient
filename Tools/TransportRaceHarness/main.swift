@@ -211,15 +211,15 @@ func testReceiveAfterDisconnectIsIgnored() throws {
   
   transport.test_inject(.receiveMessage(.string("before")))
   try assert(delegate.messages == ["before"], "missing live receive")
-  let armCount = transport.test_receiveArmCount
-  try assert(armCount == 1, "expected one receive re-arm, got \(armCount)")
+  let rearmAttempts = transport.test_receiveRearmAttempts
+  try assert(rearmAttempts == 1, "expected one receive re-arm, got \(rearmAttempts)")
   
   transport.disconnect(code: Socket.CloseCode.normal.rawValue, reason: nil)
   transport.test_inject(.receiveMessage(.string("after")))
   transport.test_inject(.receiveFailure(URLError(.cancelled)))
   
   try assert(delegate.messages == ["before"], "delivered receive after disconnect: \(delegate.messages)")
-  try assert(transport.test_receiveArmCount == armCount, "receive was re-armed after disconnect")
+  try assert(transport.test_receiveRearmAttempts == rearmAttempts, "receive was re-armed after disconnect")
   try assert(delegate.events == ["message"], "unexpected terminal events: \(delegate.events)")
 }
 

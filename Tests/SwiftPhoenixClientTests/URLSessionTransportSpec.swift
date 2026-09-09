@@ -9,7 +9,9 @@
 import Foundation
 import Quick
 import Nimble
-@testable import SwiftPhoenixClient
+// `@testable` alone does not grant access to `@_spi` declarations, and the teardown specs
+// below drive the transport through its `TransportTesting` seam.
+@_spi(TransportTesting) @testable import SwiftPhoenixClient
 
 @available(iOS 13, macOS 10.15, *)
 private final class RecordingTransportDelegate: PhoenixTransportDelegate {
@@ -112,6 +114,16 @@ class URLSessionTransportSpec: QuickSpec {
     describe("serialized teardown") {
       func makeTransport() -> URLSessionTransport {
         URLSessionTransport(url: URL(string: "ws://localhost:1/socket/websocket")!)
+      }
+      
+      // Every spec below is gated on `#available` because `URLSessionTransport` is, which
+      // would otherwise make them silently pass on an older runtime rather than run.
+      it("runs on a runtime with URLSession WebSocket support") {
+        if #available(iOS 13, macOS 10.15, *) {
+          // Supported; the specs below will actually execute.
+        } else {
+          fail("The serialized teardown specs require iOS 13 / macOS 10.15 or later")
+        }
       }
       
       it("does not overlap teardown with an in-flight error callback") {
@@ -254,15 +266,15 @@ class URLSessionTransportSpec: QuickSpec {
           
           transport.test_inject(.receiveMessage(.string("before")))
           expect(delegate.messages).to(equal(["before"]))
-          let armCount = transport.test_receiveArmCount
-          expect(armCount).to(equal(1))
+          let rearmAttempts = transport.test_receiveRearmAttempts
+          expect(rearmAttempts).to(equal(1))
           
           transport.disconnect(code: Socket.CloseCode.normal.rawValue, reason: nil)
           transport.test_inject(.receiveMessage(.string("after")))
           transport.test_inject(.receiveFailure(URLError(.cancelled)))
           
           expect(delegate.messages).to(equal(["before"]))
-          expect(transport.test_receiveArmCount).to(equal(armCount))
+          expect(transport.test_receiveRearmAttempts).to(equal(rearmAttempts))
           expect(delegate.events).to(equal(["message"]))
         }
       }
