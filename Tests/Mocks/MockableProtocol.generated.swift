@@ -40,11 +40,15 @@ class PhoenixTransportMock: PhoenixTransport {
     var connectCalled: Bool {
         return connectCallsCount > 0
     }
-    var connectClosure: (() -> Void)?
+    var connectReceivedHeaders: [String: Any]?
+    var connectReceivedInvocations: [[String: Any]] = []
+    var connectClosure: (([String: Any]) -> Void)?
 
-    func connect(with headers: [String: Any] = [:]) {
+    func connect(with headers: [String: Any]) {
         connectCallsCount += 1
-        connectClosure?()
+        connectReceivedHeaders = headers
+        connectReceivedInvocations.append(headers)
+        connectClosure?(headers)
     }
 
     //MARK: - disconnect
